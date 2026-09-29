@@ -1,6 +1,4 @@
 <div align="center">
-  <img src="assets/banner.png" alt="Prime Spot Grid Trading Bot" width="800"/>
-
   <h1>Prime Spot Grid Trading Bot</h1>
   <p><strong>Advanced Automated Crypto Trading Bot for Binance Spot Market</strong></p>
 
