@@ -85,11 +85,16 @@ BACKUP_DIR="/tmp/grid_bot_backup_$(date +%s)"
 if [ -d "$APP_DIR" ]; then
     echo ">>>Backing up configuration and state files..."
     mkdir -p "$BACKUP_DIR"
-    cp "$APP_DIR/config.enc" "$BACKUP_DIR/" 2>/dev/null || true
+    
+    cp "$APP_DIR/grid_config.enc" "$BACKUP_DIR/" 2>/dev/null || true
+    cp "$APP_DIR/grid_server_state.json" "$BACKUP_DIR/" 2>/dev/null || true
     cp "$APP_DIR/grid_license.sig" "$BACKUP_DIR/" 2>/dev/null || true
-    cp "$APP_DIR/state_mainnet.json" "$BACKUP_DIR/" 2>/dev/null || true
-    cp "$APP_DIR/state_testnet.json" "$BACKUP_DIR/" 2>/dev/null || true
     cp "$APP_DIR/.device_seed" "$BACKUP_DIR/" 2>/dev/null || true
+  
+    cp "$APP_DIR/grid_server_cert.pem" "$BACKUP_DIR/" 2>/dev/null || true
+    cp "$APP_DIR/grid_server_key.pem" "$BACKUP_DIR/" 2>/dev/null || true
+    cp "$APP_DIR"/trades*.log "$BACKUP_DIR/" 2>/dev/null || true
+    cp "$APP_DIR/trades_log_index.txt" "$BACKUP_DIR/" 2>/dev/null || true
 fi
 # --- END OF BACKUP ---
 
