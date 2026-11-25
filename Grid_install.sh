@@ -2,7 +2,7 @@
 
 # =======================================================
 # Prime Spot Grid Trading Bot - Auto Installer (Standalone)
-# Version: 1.4 (Production Hardened + safe download)
+# Version: 1.5 (Production Hardened + safe download + RAM-scaled memory guardrails)
 # =======================================================
 
 # 1. Configuration
@@ -13,6 +13,9 @@ INSTALL_DIR="/opt/Prime-Spot-Grid-Trading-Bot"
 APP_DIR="$INSTALL_DIR/Grid_server"
 SERVICE_NAME="primespotgrid"
 SERVICE_USER="primegrid"
+# The server now ships with its own plain-Python "ccxt" folder next to Grid_server.bin (hybrid build).
+# 1 = refuse to install an archive that does not contain it. Set to 0 only for an old fully-compiled archive.
+REQUIRE_CCXT=1
 
 # 2. Check for Root (Required for installation steps)
 if [ "$EUID" -ne 0 ]; then
@@ -102,11 +105,19 @@ if ! curl -fL --progress-bar "$DOWNLOAD_URL" -o "$INSTALL_DIR/$ARCHIVE_NAME"; th
     rm -f "$INSTALL_DIR/$ARCHIVE_NAME"
     exit 1
 fi
-if ! tar -tf "$INSTALL_DIR/$ARCHIVE_NAME" 2>/dev/null | grep -q 'Grid_server\.bin$'; then
+ARCHIVE_LIST=$(tar -tf "$INSTALL_DIR/$ARCHIVE_NAME" 2>/dev/null)
+if ! echo "$ARCHIVE_LIST" | grep -q 'Grid_server\.bin$'; then
     echo "Error: Downloaded archive is corrupt or does not contain Grid_server.bin. Existing installation was NOT touched."
     rm -f "$INSTALL_DIR/$ARCHIVE_NAME"
     exit 1
 fi
+if [ "$REQUIRE_CCXT" = "1" ] && ! echo "$ARCHIVE_LIST" | grep -Eq '(^|/)ccxt/__init__\.py$'; then
+    echo "Error: Downloaded archive does not contain the ccxt folder (ccxt/__init__.py). The server would not start."
+    echo "       Existing installation was NOT touched."
+    rm -f "$INSTALL_DIR/$ARCHIVE_NAME"
+    exit 1
+fi
+unset ARCHIVE_LIST
 
 # 6. Setup Directory & Clean up Old Processes
 echo ">>>Creating base directory at $INSTALL_DIR..."
@@ -138,6 +149,7 @@ if [ -d "$APP_DIR" ]; then
     cp "$APP_DIR/grid_server_key.pem" "$BACKUP_DIR/" 2>/dev/null || true
     
     cp "$APP_DIR"/grid_server.log* "$BACKUP_DIR/" 2>/dev/null || true
+    cp "$APP_DIR"/server.error.log* "$BACKUP_DIR/" 2>/dev/null || true
     cp "$APP_DIR"/trades*.log "$BACKUP_DIR/" 2>/dev/null || true
     cp "$APP_DIR/trades_log_index.txt" "$BACKUP_DIR/" 2>/dev/null || true
 fi
@@ -157,11 +169,57 @@ if [ -d "$BACKUP_DIR" ]; then
 fi
 # --- END OF RESTORE ---
 
+# 8.5. Sanity check: the extracted application must be complete (binary + its ccxt folder)
+if [ ! -f "$APP_DIR/Grid_server.bin" ]; then
+    echo "Error: Grid_server.bin is missing after extraction."
+    exit 1
+fi
+if [ "$REQUIRE_CCXT" = "1" ] && [ ! -f "$APP_DIR/ccxt/__init__.py" ]; then
+    echo "Error: ccxt/__init__.py is missing after extraction."
+    exit 1
+fi
+
 # 9. Set Permissions & Ownership
 echo ">>>Setting executable permissions and ownership for $SERVICE_USER..."
 chmod +x "$APP_DIR/Grid_server.bin"
 chmod 600 "$APP_DIR/grid_server_key.pem" "$APP_DIR/grid_config.enc" "$APP_DIR/grid_license.sig" 2>/dev/null || true
 chown -R "$SERVICE_USER:$SERVICE_GROUP" "$INSTALL_DIR"
+
+# 9.5. Memory guardrails scaled to THIS machine (the bot itself needs roughly 200-350 MB and adapts its own
+# restart threshold at run time; these cgroup limits are only the outer safety net of the operating system).
+# The share of RAM the bot may claim shrinks as the machine grows (more room is left for other applications):
+#   MemoryHigh = min(1536 MB, 420 + 0.30 x (RAM - 1000 MB)),  MemoryMax = 1.2 x MemoryHigh
+#   1 GB -> 420/504 MB (as before) | 2 GB -> ~734/880 MB | 4 GB -> ~1348/1617 MB | 8 GB+ -> 1536/1843 MB (cap)
+MEM_MB=$(awk '/^MemTotal:/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null)
+[ -z "$MEM_MB" ] && MEM_MB=1024
+MEM_HIGH_MB=420
+if [ "$MEM_MB" -gt 1000 ]; then
+    MEM_HIGH_MB=$(( 420 + 30 * (MEM_MB - 1000) / 100 ))
+fi
+[ "$MEM_HIGH_MB" -gt 1536 ] && MEM_HIGH_MB=1536
+MEM_MAX_MB=$(( MEM_HIGH_MB * 12 / 10 ))
+if [ "$MEM_MAX_MB" -gt $(( MEM_MB * 75 / 100 )) ]; then
+    # Very small machine: never let the limit exceed 75% of RAM.
+    MEM_MAX_MB=$(( MEM_MB * 75 / 100 ))
+    MEM_HIGH_MB=$(( MEM_MAX_MB * 84 / 100 ))
+fi
+if [ "$MEM_MB" -lt 900 ]; then
+    echo "Warning: this machine has only ${MEM_MB} MB of RAM. The bot may be tight on memory; 1 GB or more is recommended."
+fi
+echo ">>>Host RAM: ${MEM_MB} MB -> service memory limits: MemoryHigh=${MEM_HIGH_MB}M, MemoryMax=${MEM_MAX_MB}M"
+
+# An old hand-made drop-in (memory.conf) would silently override the limits above. Move it aside, never delete it.
+DROPIN_DIR="/etc/systemd/system/${SERVICE_NAME}.service.d"
+if [ -f "$DROPIN_DIR/memory.conf" ]; then
+    DROPIN_BAK="$DROPIN_DIR/memory.conf.replaced-by-installer-$(date +%s)"
+    mv "$DROPIN_DIR/memory.conf" "$DROPIN_BAK"
+    echo ">>>Notice: an old drop-in $DROPIN_DIR/memory.conf overrode the memory limits. Moved aside to:"
+    echo "          $DROPIN_BAK"
+fi
+if ls "$DROPIN_DIR"/*.conf >/dev/null 2>&1; then
+    echo ">>>Note: these drop-in files are still active (installer does not touch them):"
+    ls -1 "$DROPIN_DIR"/*.conf | sed 's/^/          /'
+fi
 
 # 10. Create Systemd Service
 echo ">>>Creating Service..."
@@ -183,11 +241,12 @@ StandardOutput=null
 StandardError=append:$APP_DIR/server.error.log
 NoNewPrivileges=true
 
-# Memory guardrails for 1GB RAM VPS. A little swap is allowed so cold pages can leave RAM (keeps code
-# pages hot = avoids the page-cache thrashing seen on this VPS), but a runaway leak is still cut off:
-# RAM > 500M or swap > 256M -> kernel kills the bot and systemd restarts it after 5s.
-MemoryHigh=420M
-MemoryMax=500M
+# Memory guardrails, scaled to the host RAM by the installer (see section 9.5 of Grid_install.sh).
+# A little swap is allowed so cold pages can leave RAM (keeps code pages hot = avoids page-cache thrashing),
+# but a runaway process is still cut off: RAM > MemoryMax or swap > 256M -> kernel kills the bot and
+# systemd restarts it after 5s. (The bot also restarts itself earlier, at a threshold it computes from its own baseline.)
+MemoryHigh=${MEM_HIGH_MB}M
+MemoryMax=${MEM_MAX_MB}M
 MemorySwapMax=256M
 
 [Install]
@@ -200,7 +259,7 @@ systemctl enable $SERVICE_NAME >/dev/null 2>&1
 systemctl restart $SERVICE_NAME
 
 # 12. Final Check
-sleep 2
+sleep 5
 IS_ACTIVE=$(systemctl is-active $SERVICE_NAME)
 
 echo "=================================================="
@@ -209,6 +268,7 @@ if [ "$IS_ACTIVE" == "active" ]; then
     echo "INSTALLATION SUCCESSFUL!"
     echo "Server IP: $SERVER_IP"
     echo "Port: 8764"
+    echo "Memory limits: MemoryHigh=${MEM_HIGH_MB}M, MemoryMax=${MEM_MAX_MB}M (host RAM ${MEM_MB} MB)"
     echo ""
     echo "View Log:  sudo tail -f $APP_DIR/grid_server.log"
     echo "Stop Bot:  sudo systemctl stop $SERVICE_NAME"
