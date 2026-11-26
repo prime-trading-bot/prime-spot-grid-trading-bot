@@ -2,7 +2,7 @@
 
 # =======================================================
 # Prime Spot Grid Trading Bot - Auto Installer (Standalone)
-# Version: 1.5 (Production Hardened + safe download + RAM-scaled memory guardrails)
+# Version: 1.6 (Production Hardened + safe download + RAM-scaled memory guardrails + clock sync check)
 # =======================================================
 
 # 1. Configuration
@@ -119,6 +119,19 @@ if [ "$REQUIRE_CCXT" = "1" ] && ! echo "$ARCHIVE_LIST" | grep -Eq '(^|/)ccxt/__i
 fi
 unset ARCHIVE_LIST
 
+# 5.95. Clock check: Binance rejects signed requests when the server clock is more than 1 second ahead (error -1021).
+if command -v timedatectl >/dev/null 2>&1; then
+    if [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" != "yes" ]; then
+        echo ">>>The system clock is not NTP-synchronized. Trying to enable time synchronization..."
+        timedatectl set-ntp true >/dev/null 2>&1 || true
+        sleep 2
+        if [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" != "yes" ]; then
+            echo "Warning: the clock is still not synchronized. If the bot reports error -1021 (timestamp), install and start"
+            echo "         a time service (chrony or systemd-timesyncd) and check it with: timedatectl status"
+        fi
+    fi
+fi
+
 # 6. Setup Directory & Clean up Old Processes
 echo ">>>Creating base directory at $INSTALL_DIR..."
 mkdir -p "$INSTALL_DIR"
@@ -185,24 +198,17 @@ chmod +x "$APP_DIR/Grid_server.bin"
 chmod 600 "$APP_DIR/grid_server_key.pem" "$APP_DIR/grid_config.enc" "$APP_DIR/grid_license.sig" 2>/dev/null || true
 chown -R "$SERVICE_USER:$SERVICE_GROUP" "$INSTALL_DIR"
 
-# 9.5. Memory guardrails scaled to THIS machine (the bot itself needs roughly 200-350 MB and adapts its own
-# restart threshold at run time; these cgroup limits are only the outer safety net of the operating system).
-# The share of RAM the bot may claim shrinks as the machine grows (more room is left for other applications):
-#   MemoryHigh = min(1536 MB, 420 + 0.30 x (RAM - 1000 MB)),  MemoryMax = 1.2 x MemoryHigh
-#   1 GB -> 420/504 MB (as before) | 2 GB -> ~734/880 MB | 4 GB -> ~1348/1617 MB | 8 GB+ -> 1536/1843 MB (cap)
+# 9.5. Memory guardrails scaled to THIS machine. The bot itself needs roughly 200-350 MB and adapts its own restart
+# threshold at run time; these cgroup limits are only the outer safety net of the operating system.
+# A VPS rented for this bot normally runs nothing else, so the bot may use most of the RAM:
+#   MemoryMax  = min(70% of RAM, 3072 MB),   MemoryHigh = 85% of MemoryMax
+#   1 GB -> ~571/672 MB | 2 GB -> ~1218/1433 MB | 4 GB -> ~2437/2867 MB | 8 GB+ -> 2611/3072 MB (cap)
+# (Raising the limits does not make the bot use more memory: it only gives more room before the OS steps in.)
 MEM_MB=$(awk '/^MemTotal:/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null)
 [ -z "$MEM_MB" ] && MEM_MB=1024
-MEM_HIGH_MB=420
-if [ "$MEM_MB" -gt 1000 ]; then
-    MEM_HIGH_MB=$(( 420 + 30 * (MEM_MB - 1000) / 100 ))
-fi
-[ "$MEM_HIGH_MB" -gt 1536 ] && MEM_HIGH_MB=1536
-MEM_MAX_MB=$(( MEM_HIGH_MB * 12 / 10 ))
-if [ "$MEM_MAX_MB" -gt $(( MEM_MB * 75 / 100 )) ]; then
-    # Very small machine: never let the limit exceed 75% of RAM.
-    MEM_MAX_MB=$(( MEM_MB * 75 / 100 ))
-    MEM_HIGH_MB=$(( MEM_MAX_MB * 84 / 100 ))
-fi
+MEM_MAX_MB=$(( MEM_MB * 70 / 100 ))
+[ "$MEM_MAX_MB" -gt 3072 ] && MEM_MAX_MB=3072
+MEM_HIGH_MB=$(( MEM_MAX_MB * 85 / 100 ))
 if [ "$MEM_MB" -lt 900 ]; then
     echo "Warning: this machine has only ${MEM_MB} MB of RAM. The bot may be tight on memory; 1 GB or more is recommended."
 fi
